@@ -17,7 +17,12 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-var logger *zap.Logger
+var (
+	logger            *zap.Logger
+	allowedOrigins    map[string]bool
+	proxy             *httputil.ReverseProxy
+	connectionLimiter = make(chan struct{}, 5)
+)
 
 type contextKey string
 
@@ -66,7 +71,7 @@ func main() {
 	}
 
 	allowedList := strings.Split(originsEnv, ",")
-	allowedOrigins := make(map[string]bool)
+	allowedOrigins = make(map[string]bool)
 	for _, origin := range allowedList {
 		allowedOrigins[strings.TrimSpace(origin)] = true
 	}
@@ -81,7 +86,7 @@ func main() {
 		},
 	}
 
-	proxy := &httputil.ReverseProxy{
+	proxy = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			targetParam := req.URL.Query().Get("url")
 			target, err := url.Parse(targetParam)
@@ -137,32 +142,7 @@ func main() {
 		},
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if allowedOrigins[origin] {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
-			w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
-		} else if origin != "" {
-			logger.Warn("Unauthorized origin blocked", zap.String("origin", origin))
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		targetURL := r.URL.Query().Get("url")
-		if targetURL == "" {
-			http.Error(w, "Missing url", http.StatusBadRequest)
-			return
-		}
-
-		proxy.ServeHTTP(w, r)
-	})
+	http.HandleFunc("/", handleRequest)
 
 	port := os.Getenv("PROXY_PORT")
 	if port == "" {
@@ -173,6 +153,41 @@ func main() {
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		logger.Fatal("Fatal error", zap.Error(err))
 	}
+}
+
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if allowedOrigins[origin] {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range, X-Terms-Accepted")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
+	} else if origin != "" {
+		logger.Warn("Unauthorized origin blocked", zap.String("origin", origin))
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if r.Header.Get("X-Terms-Accepted") != "true" {
+		http.Error(w, "Terms of Service not accepted", http.StatusForbidden)
+		return
+	}
+
+	targetURL := r.URL.Query().Get("url")
+	if targetURL == "" {
+		http.Error(w, "Missing url", http.StatusBadRequest)
+		return
+	}
+
+	connectionLimiter <- struct{}{}
+	defer func() { <-connectionLimiter }()
+
+	proxy.ServeHTTP(w, r)
 }
 
 func rewriteManifest(resp *http.Response, schemeKey, hostKey interface{}) error {

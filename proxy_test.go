@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"testing"
@@ -47,5 +49,74 @@ func TestRewriteManifest(t *testing.T) {
 	expectedBase := "https://proxy.com/?url="
 	if !strings.Contains(rewritten, expectedBase) {
 		t.Errorf("Expected proxy base %q not found in rewritten manifest.\nGot: %s", expectedBase, rewritten)
+	}
+}
+
+type mockTransport struct{}
+
+func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("OK"))}, nil
+}
+
+func TestHandleRequest_Headers(t *testing.T) {
+	// Setup globals
+	allowedOrigins = map[string]bool{"http://test.com": true}
+	proxy = &httputil.ReverseProxy{
+		Director:  func(req *http.Request) {},
+		Transport: &mockTransport{},
+	}
+
+	tests := []struct {
+		name           string
+		headers        map[string]string
+		query          string
+		method         string
+		expectedStatus int
+	}{
+		{
+			name:           "Missing Header",
+			headers:        map[string]string{"Origin": "http://test.com"},
+			query:          "?url=http://target.com",
+			method:         "GET",
+			expectedStatus: http.StatusForbidden,
+		},
+		{
+			name:           "Wrong Header Value",
+			headers:        map[string]string{"Origin": "http://test.com", "X-Terms-Accepted": "false"},
+			query:          "?url=http://target.com",
+			method:         "GET",
+			expectedStatus: http.StatusForbidden,
+		},
+		{
+			name:           "Correct Header",
+			headers:        map[string]string{"Origin": "http://test.com", "X-Terms-Accepted": "true"},
+			query:          "?url=http://target.com",
+			method:         "GET",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "Options Request Skip Check",
+			headers:        map[string]string{"Origin": "http://test.com"},
+			query:          "?url=http://target.com",
+			method:         "OPTIONS",
+			expectedStatus: http.StatusNoContent,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "http://proxy.com/"+tt.query, nil)
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+
+			w := httptest.NewRecorder()
+			handleRequest(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tt.expectedStatus {
+				t.Errorf("expected status %d, got %d", tt.expectedStatus, resp.StatusCode)
+			}
+		})
 	}
 }
