@@ -10,9 +10,48 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+var logger *zap.Logger
+
+func initLogger() {
+	logPath := os.Getenv("LOG_PATH")
+	if logPath == "" {
+		logPath = "/app/logs/proxy.log"
+	}
+
+	w := zapcore.AddSync(&lumberjack.Logger{
+		Filename:   logPath,
+		MaxSize:    10,
+		MaxBackups: 3,
+		MaxAge:     28,
+		Compress:   true,
+	})
+
+	core := zapcore.NewTee(
+		zapcore.NewCore(
+			zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+			w,
+			zap.InfoLevel,
+		),
+		zapcore.NewCore(
+			zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()),
+			zapcore.AddSync(os.Stdout),
+			zap.InfoLevel,
+		),
+	)
+
+	logger = zap.New(core)
+}
+
 func main() {
+	initLogger()
+	defer logger.Sync()
+
 	originsEnv := os.Getenv("ALLOWED_ORIGINS")
 	if originsEnv == "" {
 		originsEnv = "http://localhost:5173"
@@ -24,36 +63,66 @@ func main() {
 		allowedOrigins[strings.TrimSpace(origin)] = true
 	}
 
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+	}
+
+	httpClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			targetParam := req.URL.Query().Get("url")
 			target, err := url.Parse(targetParam)
 			if err != nil || target.Scheme == "" {
+				logger.Warn("Malformed target URL", zap.String("url", targetParam))
 				return
 			}
 			req.URL = target
 			req.Host = target.Host
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 		},
+		Transport: transport,
 		ModifyResponse: func(resp *http.Response) error {
+			if resp.StatusCode >= 300 && resp.StatusCode <= 308 {
+				location := resp.Header.Get("Location")
+				if location != "" {
+					targetURL, _ := url.Parse(location)
+					originalURL := resp.Request.URL
+					resolvedURL := originalURL.ResolveReference(targetURL)
+
+					newResp, err := httpClient.Get(resolvedURL.String())
+					if err == nil {
+						*resp = *newResp
+					}
+				}
+			}
+
 			contentType := resp.Header.Get("Content-Type")
 			if strings.Contains(contentType, "mpegurl") || strings.Contains(contentType, "x-mpegurl") {
 				return rewriteManifest(resp)
 			}
 			return nil
 		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.Error("Proxy error", zap.Error(err), zap.String("url", r.URL.Query().Get("url")))
+			w.WriteHeader(http.StatusBadGateway)
+		},
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-
 		if allowedOrigins[origin] {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
 			w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
 		} else if origin != "" {
-			http.Error(w, "Origin not allowed", http.StatusForbidden)
+			logger.Warn("Unauthorized origin blocked", zap.String("origin", origin))
+			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 
@@ -62,8 +131,9 @@ func main() {
 			return
 		}
 
-		if r.URL.Query().Get("url") == "" {
-			http.Error(w, "Missing 'url' parameter", http.StatusBadRequest)
+		targetURL := r.URL.Query().Get("url")
+		if targetURL == "" {
+			http.Error(w, "Missing url", http.StatusBadRequest)
 			return
 		}
 
@@ -75,10 +145,9 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Printf("HLS Proxy started on :%s\n", port)
-	fmt.Printf("Allowed Origins: %s\n", originsEnv)
+	logger.Info("Server running", zap.String("port", port))
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		panic(err)
+		logger.Fatal("Fatal error", zap.Error(err))
 	}
 }
 
@@ -89,8 +158,7 @@ func rewriteManifest(resp *http.Response) error {
 	}
 	resp.Body.Close()
 
-	origURL := resp.Request.URL
-	baseDir := origURL.Scheme + "://" + origURL.Host + origURL.Path[:strings.LastIndex(origURL.Path, "/")+1]
+	baseLoc := resp.Request.URL
 
 	scheme := "https"
 	if resp.Request.TLS == nil && resp.Request.Header.Get("X-Forwarded-Proto") != "https" {
@@ -103,11 +171,11 @@ func rewriteManifest(resp *http.Response) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if len(line) > 0 && !strings.HasPrefix(line, "#") {
-			fullURL := line
-			if !strings.HasPrefix(line, "http") {
-				fullURL = baseDir + line
+			lineURL, err := url.Parse(line)
+			if err == nil {
+				resolvedURL := baseLoc.ResolveReference(lineURL)
+				line = proxyBase + url.QueryEscape(resolvedURL.String())
 			}
-			line = proxyBase + url.QueryEscape(fullURL)
 		}
 		buffer.WriteString(line + "\n")
 	}
