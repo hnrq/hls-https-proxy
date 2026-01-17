@@ -124,6 +124,8 @@ func main() {
 			}
 
 			contentType := resp.Header.Get("Content-Type")
+			resp.Header.Del("Access-Control-Allow-Origin") // Remove CORS header to avoid conflicts
+
 			if strings.Contains(contentType, "mpegurl") || strings.Contains(contentType, "x-mpegurl") {
 				return rewriteManifest(resp, proxySchemeKey, proxyHostKey)
 			}
