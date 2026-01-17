@@ -1,0 +1,13 @@
+services:
+  hls-proxy:
+    build: .
+    restart: always
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'    # Max 10% of one CPU core
+          memory: 64M    # Hard limit of 64MB RAM
+        reservations:
+          memory: 16M    # Guaranteed 16MB RAM
