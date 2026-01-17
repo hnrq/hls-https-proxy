@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,13 @@ import (
 )
 
 var logger *zap.Logger
+
+type contextKey string
+
+const (
+	proxyHostKey   contextKey = "proxyHost"
+	proxySchemeKey contextKey = "proxyScheme"
+)
 
 func initLogger() {
 	logPath := os.Getenv("LOG_PATH")
@@ -81,6 +89,19 @@ func main() {
 				logger.Warn("Malformed target URL", zap.String("url", targetParam))
 				return
 			}
+
+			// Capture original host and scheme
+			originalHost := req.Host
+			originalScheme := "http"
+			if req.TLS != nil || req.Header.Get("X-Forwarded-Proto") == "https" {
+				originalScheme = "https"
+			}
+
+			// Inject into context
+			ctx := context.WithValue(req.Context(), proxyHostKey, originalHost)
+			ctx = context.WithValue(ctx, proxySchemeKey, originalScheme)
+			*req = *req.WithContext(ctx)
+
 			req.URL = target
 			req.Host = target.Host
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -94,7 +115,8 @@ func main() {
 					originalURL := resp.Request.URL
 					resolvedURL := originalURL.ResolveReference(targetURL)
 
-					newResp, err := httpClient.Get(resolvedURL.String())
+					req, _ := http.NewRequestWithContext(resp.Request.Context(), "GET", resolvedURL.String(), nil)
+					newResp, err := httpClient.Do(req)
 					if err == nil {
 						*resp = *newResp
 					}
@@ -103,7 +125,7 @@ func main() {
 
 			contentType := resp.Header.Get("Content-Type")
 			if strings.Contains(contentType, "mpegurl") || strings.Contains(contentType, "x-mpegurl") {
-				return rewriteManifest(resp)
+				return rewriteManifest(resp, proxySchemeKey, proxyHostKey)
 			}
 			return nil
 		},
@@ -151,7 +173,7 @@ func main() {
 	}
 }
 
-func rewriteManifest(resp *http.Response) error {
+func rewriteManifest(resp *http.Response, schemeKey, hostKey interface{}) error {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -160,11 +182,17 @@ func rewriteManifest(resp *http.Response) error {
 
 	baseLoc := resp.Request.URL
 
-	scheme := "https"
-	if resp.Request.TLS == nil && resp.Request.Header.Get("X-Forwarded-Proto") != "https" {
+	scheme, _ := resp.Request.Context().Value(schemeKey).(string)
+	if scheme == "" {
 		scheme = "http"
 	}
-	proxyBase := fmt.Sprintf("%s://%s/?url=", scheme, resp.Request.Host)
+
+	host, _ := resp.Request.Context().Value(hostKey).(string)
+	if host == "" {
+		host = resp.Request.Host
+	}
+
+	proxyBase := fmt.Sprintf("%s://%s/?url=", scheme, host)
 
 	var buffer bytes.Buffer
 	scanner := bufio.NewScanner(bytes.NewReader(body))

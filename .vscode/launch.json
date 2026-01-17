@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch main.go",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/main.go",
+      "env": {
+        "LOG_PATH": "${workspaceFolder}/proxy.log",
+        "ALLOWED_ORIGINS": "http://localhost:5173",
+        "PROXY_PORT": "8080"
+      }
+    }
+  ]
+}

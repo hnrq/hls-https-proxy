@@ -30,4 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
-proxy.logs
+*.log
+*_debug_*
+
